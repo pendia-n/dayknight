@@ -2,11 +2,13 @@ package main
 
 import (
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -34,6 +36,8 @@ type sessionState int
 
 const (
 	stateSelectDB sessionState = iota
+	stateSelectProfile
+	stateInputProfileName
 	stateInputHost
 	stateInputPort
 	stateInputUser
@@ -42,6 +46,7 @@ const (
 	stateExplorer
 	stateQuery
 	stateResult
+	stateExport
 )
 
 type explorerFocus int
@@ -50,6 +55,39 @@ const (
 	focusDB explorerFocus = iota
 	focusTable
 )
+
+type Profile struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"` // "mysql" or "sqlite3"
+	Host     string `json:"host,omitempty"`
+	Port     string `json:"port,omitempty"`
+	User     string `json:"user,omitempty"`
+	Password string `json:"password,omitempty"`
+	Path     string `json:"path,omitempty"`
+}
+
+type Config struct {
+	Profiles []Profile `json:"profiles"`
+}
+
+func getConfigPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".dayknight.json")
+}
+
+func loadConfig() Config {
+	var cfg Config
+	data, err := os.ReadFile(getConfigPath())
+	if err == nil {
+		json.Unmarshal(data, &cfg)
+	}
+	return cfg
+}
+
+func saveConfig(cfg Config) {
+	data, _ := json.Marshal(cfg)
+	os.WriteFile(getConfigPath(), data, 0644)
+}
 
 type item string
 
@@ -81,6 +119,7 @@ type model struct {
 	dbList     list.Model
 	tableList  list.Model
 	resTable   table.Model
+	profileList list.Model
 	schemaView viewport.Model
 	jsonView   viewport.Model
 	err        error
@@ -91,13 +130,20 @@ type model struct {
 	focus    explorerFocus
 	activeDB string
 	results  []map[string]interface{}
+	columns  []string
 	viewMode string // "table" or "json"
 
-	// Connection details
-	host, port, user, password, sqlitePath string
+	// Pagination
+	page     int
+	pageSize int
+
+	// Temp profile creation
+	newProfile Profile
+	config     Config
 }
 
 func initialModel() model {
+	cfg := loadConfig()
 	dDelegate := itemDelegate{}
 	dbList := list.New([]list.Item{}, dDelegate, 0, 0)
 	dbList.Title = "Databases"
@@ -109,12 +155,20 @@ func initialModel() model {
 	tList.SetShowStatusBar(false)
 	tList.SetFilteringEnabled(false)
 
+	pList := list.New([]list.Item{}, dDelegate, 0, 0)
+	pList.Title = "Select Profile"
+	pList.SetShowStatusBar(false)
+	pList.SetFilteringEnabled(false)
+
 	return model{
-		state:     stateSelectDB,
-		dbType:    "mysql",
-		dbList:    dbList,
-		tableList: tList,
-		viewMode:  "table",
+		state:       stateSelectDB,
+		dbType:      "mysql",
+		dbList:      dbList,
+		tableList:   tList,
+		profileList: pList,
+		viewMode:    "table",
+		pageSize:    100,
+		config:      cfg,
 	}
 }
 
@@ -144,6 +198,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.db.Close()
 				}
 				return m, nil
+			case stateExport:
+				m.state = stateResult
+				return m, nil
+			case stateSelectProfile:
+				m.state = stateSelectDB
+				return m, nil
 			default:
 				m.state = stateSelectDB
 				return m, nil
@@ -155,6 +215,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.dbType = "sqlite3"
 				} else {
 					m.dbType = "mysql"
+				}
+				return m, nil
+			}
+
+		case "left", "right":
+			if m.state == stateResult && len(m.results) > 1200 {
+				if msg.String() == "left" && m.page > 0 {
+					m.page--
+					m.updateResultTable()
+				} else if msg.String() == "right" && (m.page+1)*m.pageSize < len(m.results) {
+					m.page++
+					m.updateResultTable()
 				}
 				return m, nil
 			}
@@ -179,6 +251,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			return m.handleEnter()
+
+		case "e":
+			if m.state == stateResult {
+				m.state = stateExport
+				m.setupInput("export_filename.csv", "query_results.csv", false)
+				return m, nil
+			}
 		}
 
 	case tea.WindowSizeMsg:
@@ -186,11 +265,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.dbList.SetSize(m.width/4, m.height-12)
 		m.tableList.SetSize(m.width/4, m.height-12)
+		m.profileList.SetSize(m.width/2, m.height-12)
 		m.schemaView = viewport.New(m.width/2-4, m.height-12)
 		m.jsonView = viewport.New(m.width-4, m.height-12)
 	}
 
 	switch m.state {
+	case stateSelectProfile:
+		m.profileList, cmd = m.profileList.Update(msg)
 	case stateExplorer:
 		if m.focus == focusDB {
 			m.dbList, cmd = m.dbList.Update(msg)
@@ -213,8 +295,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.jsonView, cmd = m.jsonView.Update(msg)
 		}
-	case stateQuery:
-		m.inputs[0], cmd = m.inputs[0].Update(msg)
 	default:
 		if len(m.inputs) > 0 {
 			m.inputs[0], cmd = m.inputs[0].Update(msg)
@@ -239,6 +319,37 @@ func (m *model) setupInput(placeholder string, value string, sensitive bool) {
 func (m model) handleEnter() (model, tea.Cmd) {
 	switch m.state {
 	case stateSelectDB:
+		var profiles []list.Item
+		for _, p := range m.config.Profiles {
+			if p.Type == m.dbType {
+				profiles = append(profiles, item(p.Name))
+			}
+		}
+		profiles = append(profiles, item("+ Create New Profile"))
+		m.profileList.SetItems(profiles)
+		m.state = stateSelectProfile
+
+	case stateSelectProfile:
+		i, ok := m.profileList.SelectedItem().(item)
+		if !ok {
+			return m, nil
+		}
+		name := string(i)
+		if name == "+ Create New Profile" {
+			m.state = stateInputProfileName
+			m.setupInput("Profile Name (e.g. Local Prod)", "", false)
+		} else {
+			for _, p := range m.config.Profiles {
+				if p.Name == name {
+					m.newProfile = p
+					return m.connect()
+				}
+			}
+		}
+
+	case stateInputProfileName:
+		m.newProfile.Name = m.inputs[0].Value()
+		m.newProfile.Type = m.dbType
 		if m.dbType == "mysql" {
 			m.state = stateInputHost
 			m.setupInput("Host (localhost)", "localhost", false)
@@ -246,48 +357,55 @@ func (m model) handleEnter() (model, tea.Cmd) {
 			m.state = stateInputSQLitePath
 			m.setupInput("Path to SQLite file (test.db)", "test.db", false)
 		}
+
 	case stateInputHost:
-		m.host = m.inputs[0].Value()
+		m.newProfile.Host = m.inputs[0].Value()
 		m.state = stateInputPort
 		m.setupInput("Port (3306)", "3306", false)
 	case stateInputPort:
-		m.port = m.inputs[0].Value()
+		m.newProfile.Port = m.inputs[0].Value()
 		m.state = stateInputUser
 		m.setupInput("User (root)", "root", false)
 	case stateInputUser:
-		m.user = m.inputs[0].Value()
+		m.newProfile.User = m.inputs[0].Value()
 		m.state = stateInputPass
 		m.setupInput("Password", "", true)
 	case stateInputPass:
-		m.password = m.inputs[0].Value()
+		m.newProfile.Password = m.inputs[0].Value()
 		return m.connect()
 	case stateInputSQLitePath:
-		m.sqlitePath = m.inputs[0].Value()
+		m.newProfile.Path = m.inputs[0].Value()
 		return m.connect()
+
 	case stateExplorer:
 		if i, ok := m.tableList.SelectedItem().(item); ok {
 			tableName := string(i)
-			query := fmt.Sprintf("SELECT * FROM %s LIMIT 50", tableName)
+			query := fmt.Sprintf("SELECT * FROM %s LIMIT 5000", tableName)
 			if m.dbType == "mysql" {
-				query = fmt.Sprintf("SELECT * FROM %s.%s LIMIT 50", m.activeDB, tableName)
+				query = fmt.Sprintf("SELECT * FROM %s.%s LIMIT 5000", m.activeDB, tableName)
 			}
 			m.state = stateQuery
 			m.setupInput("Query", query, false)
 		}
 	case stateQuery:
 		return m.handleQuery()
+	case stateExport:
+		filename := m.inputs[0].Value()
+		m.exportToCSV(filename)
+		m.state = stateResult
+		return m, nil
 	}
 	return m, nil
 }
 
 func (m model) connect() (model, tea.Cmd) {
 	var driver, dsn string
-	if m.dbType == "mysql" {
+	if m.newProfile.Type == "mysql" {
 		driver = "mysql"
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/", m.user, m.password, m.host, m.port)
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/", m.newProfile.User, m.newProfile.Password, m.newProfile.Host, m.newProfile.Port)
 	} else {
 		driver = "sqlite3"
-		dsn = m.sqlitePath
+		dsn = m.newProfile.Path
 	}
 
 	db, err := sql.Open(driver, dsn)
@@ -302,7 +420,21 @@ func (m model) connect() (model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Save profile if it's new
+	isNew := true
+	for _, p := range m.config.Profiles {
+		if p.Name == m.newProfile.Name {
+			isNew = false
+			break
+		}
+	}
+	if isNew {
+		m.config.Profiles = append(m.config.Profiles, m.newProfile)
+		saveConfig(m.config)
+	}
+
 	m.db = db
+	m.dbType = m.newProfile.Type
 	m.state = stateExplorer
 	m.focus = focusDB
 	return m.refreshExplorer()
@@ -419,15 +551,9 @@ func (m model) handleQuery() (model, tea.Cmd) {
 		m.err = err
 		return m, nil
 	}
+	m.columns = cols
 
-	var columns []table.Column
-	for _, col := range cols {
-		columns = append(columns, table.Column{Title: col, Width: 15})
-	}
-
-	var tableRows []table.Row
 	var results []map[string]interface{}
-
 	for rows.Next() {
 		values := make([]interface{}, len(cols))
 		valuePtrs := make([]interface{}, len(cols))
@@ -440,30 +566,63 @@ func (m model) handleQuery() (model, tea.Cmd) {
 			return m, nil
 		}
 
-		row := make(table.Row, len(cols))
 		resMap := make(map[string]interface{})
 		for i, val := range values {
-			var displayVal interface{}
 			switch v := val.(type) {
 			case nil:
-				displayVal = "NULL"
+				resMap[cols[i]] = "NULL"
 			case []byte:
-				displayVal = string(v)
+				resMap[cols[i]] = string(v)
 			default:
-				displayVal = v
+				resMap[cols[i]] = v
 			}
-			row[i] = fmt.Sprintf("%v", displayVal)
-			resMap[cols[i]] = displayVal
+		}
+		results = append(results, resMap)
+	}
+
+	m.results = results
+	m.page = 0
+	m.updateResultTable()
+	
+	jsonBytes, _ := json.MarshalIndent(results, "", "  ")
+	m.jsonView.SetContent(string(jsonBytes))
+
+	m.state = stateResult
+	m.err = nil
+	return m, nil
+}
+
+func (m *model) updateResultTable() {
+	var columns []table.Column
+	for _, col := range m.columns {
+		columns = append(columns, table.Column{Title: col, Width: 15})
+	}
+
+	start := 0
+	end := len(m.results)
+	if len(m.results) > 1200 {
+		start = m.page * m.pageSize
+		end = start + m.pageSize
+		if end > len(m.results) {
+			end = len(m.results)
+		}
+	}
+
+	var tableRows []table.Row
+	for i := start; i < end; i++ {
+		resMap := m.results[i]
+		row := make(table.Row, len(m.columns))
+		for j, col := range m.columns {
+			row[j] = fmt.Sprintf("%v", resMap[col])
 		}
 		tableRows = append(tableRows, row)
-		results = append(results, resMap)
 	}
 
 	t := table.New(
 		table.WithColumns(columns),
 		table.WithRows(tableRows),
 		table.WithFocused(true),
-		table.WithHeight(m.height-12),
+		table.WithHeight(m.height-14),
 	)
 
 	s := table.DefaultStyles()
@@ -472,14 +631,33 @@ func (m model) handleQuery() (model, tea.Cmd) {
 	t.SetStyles(s)
 
 	m.resTable = t
-	m.results = results
-	
-	jsonBytes, _ := json.MarshalIndent(results, "", "  ")
-	m.jsonView.SetContent(string(jsonBytes))
+}
 
-	m.state = stateResult
-	m.err = nil
-	return m, nil
+func (m model) exportToCSV(filename string) {
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, "Downloads", filename)
+	if !strings.HasSuffix(path, ".csv") {
+		path += ".csv"
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		m.err = err
+		return
+	}
+	defer f.Close()
+
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	writer.Write(m.columns)
+	for _, res := range m.results {
+		row := make([]string, len(m.columns))
+		for i, col := range m.columns {
+			row[i] = fmt.Sprintf("%v", res[col])
+		}
+		writer.Write(row)
+	}
 }
 
 func (m model) View() string {
@@ -497,8 +675,13 @@ func (m model) View() string {
 		}
 		s += fmt.Sprintf("%s\n%s\n\n(up/down to select, enter to continue, ctrl+q to quit)\n", mysql, sqlite)
 
-	case stateInputHost, stateInputPort, stateInputUser, stateInputPass, stateInputSQLitePath:
-		s = titleStyle.Render(fmt.Sprintf("Connecting to %s", strings.ToUpper(m.dbType))) + "\n\n"
+	case stateSelectProfile:
+		s = titleStyle.Render(fmt.Sprintf("%s Profiles", strings.ToUpper(m.dbType))) + "\n\n"
+		s += m.profileList.View() + "\n\n"
+		s += "(enter to select, esc to back, ctrl+q to quit)\n"
+
+	case stateInputProfileName, stateInputHost, stateInputPort, stateInputUser, stateInputPass, stateInputSQLitePath:
+		s = titleStyle.Render(fmt.Sprintf("Creating New %s Profile", strings.ToUpper(m.dbType))) + "\n\n"
 		if len(m.inputs) > 0 {
 			s += m.inputs[0].View() + "\n\n"
 		}
@@ -531,14 +714,28 @@ func (m model) View() string {
 
 	case stateResult:
 		title := "Query Results (Table Mode)"
-		content := baseStyle.Render(m.resTable.View())
 		if m.viewMode == "json" {
 			title = "Query Results (JSON Mode)"
+		}
+		if len(m.results) > 1200 {
+			totalPages := (len(m.results) + m.pageSize - 1) / m.pageSize
+			title += fmt.Sprintf(" - Page %d of %d (Total: %d)", m.page+1, totalPages, len(m.results))
+		}
+		
+		content := baseStyle.Render(m.resTable.View())
+		if m.viewMode == "json" {
 			content = baseStyle.Render(m.jsonView.View())
 		}
 		s = titleStyle.Render(title) + "\n\n"
 		s += content + "\n\n"
-		s += "(tab: toggle Table/JSON, arrows: scroll, esc: back to query, ctrl+q: quit)\n"
+		s += "(tab: toggle Table/JSON, e: export CSV, arrows: scroll/page, esc: back to query, ctrl+q: quit)\n"
+
+	case stateExport:
+		s = titleStyle.Render("Export to CSV (saves to Downloads)") + "\n\n"
+		if len(m.inputs) > 0 {
+			s += m.inputs[0].View() + "\n\n"
+		}
+		s += "(enter: export, esc: cancel, ctrl+q: quit)\n"
 	}
 
 	if m.err != nil {
