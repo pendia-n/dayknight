@@ -595,7 +595,19 @@ func (m model) handleQuery() (model, tea.Cmd) {
 func (m *model) updateResultTable() {
 	var columns []table.Column
 	for _, col := range m.columns {
-		columns = append(columns, table.Column{Title: col, Width: 15})
+		// Calculate max length for this column
+		maxLen := len(col)
+		for _, row := range m.results {
+			s := fmt.Sprintf("%v", row[col])
+			if len(s) > maxLen {
+				maxLen = len(s)
+			}
+		}
+		// Clamp width between 10 and 40
+		width := maxLen
+		if width < 10 { width = 10 }
+		if width > 40 { width = 40 }
+		columns = append(columns, table.Column{Title: col, Width: width})
 	}
 
 	start := 0
